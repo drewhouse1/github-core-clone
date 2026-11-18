@@ -16,7 +16,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { createServer as createNetServer, type Socket } from 'node:net';
 import { Store } from './store.ts';
 import { scenarioViewer } from './scenario.ts';
-import { advertiseV0, advertiseV2, handleReceivePack, handleUploadPack } from './git.ts';
+import { advertisedV0, advertiseV2, handleReceivePack, handleUploadPack } from './git.ts';
 import { handleRest } from './rest.ts';
 import { executeGraphQL } from './gql.ts';
 import { handleMcp } from './mcp.ts';
@@ -46,12 +46,16 @@ export interface ForgeRequest {
 
 /** One finished response: status, exact bytes, content type, extra headers.
  * The request id and content length are added by the transport at send time,
- * never stored here, so a memoized answer can be re-sent with a fresh id. */
+ * never stored here, so a memoized answer can be re-sent with a fresh id.
+ * A memo hit may also carry prebuiltHead: the constant head bytes baked at
+ * cache time (status line, content-type, content-length, request-id prefix),
+ * so sending it costs one concat of [head, fresh id, tail, body]. */
 export interface RouteResult {
   status: number;
   body: Buffer;
   contentType: string;
   headers?: Record<string, string>;
+  prebuiltHead?: { head: Buffer; tailKeepAlive: Buffer; tailClose: Buffer };
 }
 
 function jsonResult(status: number, body: unknown, headers: Record<string, string> = {}): RouteResult {
@@ -81,11 +85,15 @@ function requestId(): string {
 }
 
 function authOk(headers: Record<string, string | string[] | undefined>): boolean {
-  const expected = expectedToken();
-  if (expected === '') return true;
+  // The shop token is fixed for the process lifetime: build the expected
+  // "Bearer ..." value once instead of reading env + templating per request.
+  if (cachedBearer === null) cachedBearer = `Bearer ${expectedToken()}`;
+  if (cachedBearer === 'Bearer ') return true;
   const got = headers.authorization ?? '';
-  return got === `Bearer ${expected}`;
+  return got === cachedBearer;
 }
+
+let cachedBearer: string | null = null;
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -115,6 +123,11 @@ interface MemoEntry {
   body: Buffer;
   contentType: string;
   headers: Record<string, string>;
+  // Pre-built head bytes (see RouteResult.prebuiltHead): the head up to the
+  // request-id value, and the tail after it, for keep-alive and close.
+  head: Buffer;
+  tailKeepAlive: Buffer;
+  tailClose: Buffer;
 }
 
 const getMemo = new Map<string, MemoEntry>();
@@ -131,22 +144,42 @@ function memoKey(req: ForgeRequest, authorized: boolean): string {
 async function dispatch(req: ForgeRequest): Promise<RouteResult> {
   const isGet = req.method === 'GET';
   const memoable = isGet && req.url.startsWith('/api/v3/');
+  // Authorize once per request: the memo key and the router share it.
+  const authorized = authOk(req.headers);
   let key = '';
   if (memoable) {
-    key = memoKey(req, authOk(req.headers));
+    key = memoKey(req, authorized);
     const hit = getMemo.get(key);
     if (hit !== undefined) {
-      return { status: hit.status, body: hit.body, contentType: hit.contentType, headers: hit.headers };
+      return {
+        status: hit.status,
+        body: hit.body,
+        contentType: hit.contentType,
+        headers: hit.headers,
+        prebuiltHead: { head: hit.head, tailKeepAlive: hit.tailKeepAlive, tailClose: hit.tailClose },
+      };
     }
   }
   try {
-    const result = await handle(req);
+    const result = await handle(req, authorized);
     if (memoable && result.body.length <= GET_MEMO_MAX_BODY) {
       if (getMemo.size >= GET_MEMO_MAX_ENTRIES) {
         const oldest = getMemo.keys().next().value as string | undefined;
         if (oldest !== undefined) getMemo.delete(oldest);
       }
-      getMemo.set(key, { status: result.status, body: result.body, contentType: result.contentType, headers: result.headers ?? {} });
+      // Bake the constant head bytes now: on a hit the transport splices
+      // only a fresh request id between head and tail.
+      const tpl = headTemplate(result.status, result.contentType, result.headers ?? {});
+      const head = Buffer.concat([tpl.start, Buffer.from(String(result.body.length), 'ascii'), tpl.mid]);
+      getMemo.set(key, {
+        status: result.status,
+        body: result.body,
+        contentType: result.contentType,
+        headers: result.headers ?? {},
+        head,
+        tailKeepAlive: tpl.endKeepAlive,
+        tailClose: tpl.endClose,
+      });
     }
     return result;
   } finally {
@@ -156,15 +189,31 @@ async function dispatch(req: ForgeRequest): Promise<RouteResult> {
 
 // ---------------------------------------------------------------- routing
 
-async function handle(req: ForgeRequest): Promise<RouteResult> {
-  const method = req.method;
-  let url: URL;
+/** Read one query parameter out of a raw query string without building a
+ * URL object — the info/refs service check is the only git caller. */
+function queryParam(queryStr: string, name: string): string {
+  const needle = `${name}=`;
+  const i = queryStr.indexOf(needle);
+  if (i === -1 || (i > 0 && queryStr[i - 1] !== '&')) return '';
+  const start = i + needle.length;
+  const amp = queryStr.indexOf('&', start);
+  const raw = amp === -1 ? queryStr.slice(start) : queryStr.slice(start, amp);
   try {
-    url = new URL(req.url, 'http://entry');
+    return decodeURIComponent(raw.replace(/\+/g, ' '));
   } catch {
-    return jsonResult(404, { message: 'Not Found' });
+    return raw;
   }
-  const path = url.pathname;
+}
+
+async function handle(req: ForgeRequest, authorized: boolean): Promise<RouteResult> {
+  const method = req.method;
+  // No URL object on the hot path: split the target by hand and parse the
+  // query string lazily — only the routes that read query params pay for it.
+  const q = req.url.indexOf('?');
+  const path = q === -1 ? req.url : req.url.slice(0, q);
+  const queryStr = q === -1 ? '' : req.url.slice(q + 1);
+  let queryCache: URLSearchParams | null = null;
+  const queryParams = (): URLSearchParams => (queryCache ??= new URLSearchParams(queryStr));
   const segs = path.split('/').filter((s) => s !== '');
 
   // Health probe: no auth.
@@ -179,7 +228,7 @@ async function handle(req: ForgeRequest): Promise<RouteResult> {
     const sub = segs.slice(2).join('/');
     const repo = store.getRepo(owner, repoName);
     if (sub === 'info/refs') {
-      const service = url.searchParams.get('service') ?? '';
+      const service = queryParam(queryStr, 'service');
       if (method !== 'GET' || !repo || (service !== 'git-upload-pack' && service !== 'git-receive-pack')) {
         return jsonResult(404, { message: 'Not Found' });
       }
@@ -187,7 +236,7 @@ async function handle(req: ForgeRequest): Promise<RouteResult> {
       if (service === 'git-upload-pack' && isV2) {
         return rawResult(200, advertiseV2(), 'application/x-git-upload-pack-advertisement');
       }
-      return rawResult(200, advertiseV0(store, repo, service as 'git-upload-pack' | 'git-receive-pack'), `application/x-${service}-advertisement`);
+      return rawResult(200, advertisedV0(store, repo, service as 'git-upload-pack' | 'git-receive-pack'), `application/x-${service}-advertisement`);
     }
     if (sub === 'git-upload-pack' && method === 'POST') {
       if (!repo) {
@@ -208,7 +257,7 @@ async function handle(req: ForgeRequest): Promise<RouteResult> {
 
   // Authenticated surfaces.
   if (path === '/api/graphql' || path === '/mcp' || path === '/api/v3' || path.startsWith('/api/v3/')) {
-    if (!authOk(req.headers)) {
+    if (!authorized) {
       return jsonResult(401, { message: 'Requires authentication' });
     }
   }
@@ -264,7 +313,7 @@ async function handle(req: ForgeRequest): Promise<RouteResult> {
       }
     }
     const baseUrl = `http://${req.headers.host ?? 'entry'}`;
-    const out = handleRest({ store, query: url.searchParams, body, baseUrl }, method, restSegs);
+    const out = handleRest({ store, query: queryParams(), body, baseUrl }, method, restSegs);
     if (out.status === 204) {
       return emptyResult(204, out.headers ?? {});
     }
@@ -380,26 +429,35 @@ function parseChunked(buf: Buffer, bodyStart: number): { body: Buffer; consumed:
   }
 }
 
-/** Parse the first request out of buf, if complete. */
+/** Parse the first request out of buf, if complete. Scans the head with
+ * indexOf only — no whole-head toString/split, no per-line regex — because
+ * this runs on every request of every workload. */
 function parseRequest(buf: Buffer): ParseOut {
   const headEnd = buf.indexOf('\r\n\r\n');
   if (headEnd === -1) {
     if (buf.length > 65536) return { kind: 'bad' };
     return { kind: 'need-more', headersDone: false, expectContinue: false };
   }
-  const lines = buf.subarray(0, headEnd).toString('ascii').split('\r\n');
-  const first = lines[0].split(' ');
-  if (first.length !== 3 || !first[2].startsWith('HTTP/')) return { kind: 'bad' };
-  const method = first[0];
-  const url = first[1];
-  const version = first[2];
+  const lineEnd0 = buf.indexOf('\r\n');
+  if (lineEnd0 === -1 || lineEnd0 > headEnd) return { kind: 'bad' };
+  const sp1 = buf.indexOf(' ', 0);
+  const sp2 = sp1 === -1 ? -1 : buf.indexOf(' ', sp1 + 1);
+  if (sp1 === -1 || sp2 === -1 || sp2 > lineEnd0) return { kind: 'bad' };
+  const method = buf.subarray(0, sp1).toString('ascii');
+  const url = buf.subarray(sp1 + 1, sp2).toString('ascii');
+  const version = buf.subarray(sp2 + 1, lineEnd0).toString('ascii');
+  if (!version.startsWith('HTTP/')) return { kind: 'bad' };
   const headers: Record<string, string> = {};
-  for (let i = 1; i < lines.length; i += 1) {
-    const colon = lines[i].indexOf(':');
-    if (colon === -1) return { kind: 'bad' };
-    const name = lines[i].slice(0, colon).trim().toLowerCase();
-    const value = lines[i].slice(colon + 1).trim();
+  let pos = lineEnd0 + 2;
+  while (pos < headEnd) {
+    const eol = buf.indexOf('\r\n', pos);
+    if (eol === -1 || eol > headEnd) return { kind: 'bad' };
+    const colon = buf.indexOf(':', pos);
+    if (colon === -1 || colon > eol) return { kind: 'bad' };
+    const name = buf.subarray(pos, colon).toString('ascii').trim().toLowerCase();
+    const value = buf.subarray(colon + 1, eol).toString('ascii').trim();
     headers[name] = headers[name] === undefined ? value : `${headers[name]}, ${value}`;
+    pos = eol + 2;
   }
   const expectContinue = (headers.expect ?? '').toLowerCase() === '100-continue';
   const bodyStart = headEnd + 4;
@@ -420,21 +478,67 @@ function parseRequest(buf: Buffer): ParseOut {
   return { kind: 'request', req: { method, url, headers, body: Buffer.alloc(0) }, consumed: bodyStart, keepAlive: keepAliveFor(version, headers) };
 }
 
-/** Send one finished response as a single socket write: status line +
- * headers + body in one Buffer.concat. A 204 carries no body, so it sends
+/** Pre-built response-head templates: the constant bytes of every reply
+ * (status line, content-type, the literal "content-length: " prefix, the
+ * request-id prefix, connection line, extra headers) are encoded once per
+ * (status, content-type, extras) shape and reused verbatim. Sending a reply
+ * then costs one Buffer.concat of template parts + the two short varying
+ * values (content-length digits, request id) + body — no lines array, no
+ * join, no string-to-Buffer encoding of the head on the hot path. */
+interface HeadTemplate {
+  start: Buffer;
+  mid: Buffer;
+  endKeepAlive: Buffer;
+  endClose: Buffer;
+}
+
+const headTemplates = new Map<string, HeadTemplate>();
+
+function headTemplate(status: number, contentType: string, headers: Record<string, string> | undefined): HeadTemplate {
+  const extras = Object.entries(headers ?? {});
+  const key = `${status}|${contentType}|${extras.map(([k, v]) => `${k}:${v}`).join('|')}`;
+  const hit = headTemplates.get(key);
+  if (hit !== undefined) return hit;
+  const reason = REASONS[status] ?? 'OK';
+  const extraText = extras.map(([k, v]) => `${k}: ${v}\r\n`).join('');
+  let start: Buffer;
+  let mid: Buffer;
+  if (status === 204) {
+    start = Buffer.from(`HTTP/1.1 204 No Content\r\nx-github-request-id: `, 'ascii');
+    mid = Buffer.alloc(0);
+  } else {
+    start = Buffer.from(`HTTP/1.1 ${status} ${reason}\r\ncontent-type: ${contentType}\r\ncontent-length: `, 'ascii');
+    mid = Buffer.from('\r\nx-github-request-id: ', 'ascii');
+  }
+  const tpl: HeadTemplate = {
+    start,
+    mid,
+    endKeepAlive: Buffer.from(`\r\nconnection: keep-alive\r\n${extraText}\r\n`, 'ascii'),
+    endClose: Buffer.from(`\r\nconnection: close\r\n${extraText}\r\n`, 'ascii'),
+  };
+  if (headTemplates.size < 256) headTemplates.set(key, tpl);
+  return tpl;
+}
+
+/** Send one finished response as a single socket write: pre-built head
+ * template + body in one Buffer.concat. A 204 carries no body, so it sends
  * no content-type or content-length. */
 function writeRawResult(socket: Socket, result: RouteResult, keepAlive: boolean): void {
-  const reason = REASONS[result.status] ?? 'OK';
-  const lines: string[] = [`HTTP/1.1 ${result.status} ${reason}`];
-  if (result.status !== 204) {
-    lines.push(`content-type: ${result.contentType}`);
-    lines.push(`content-length: ${result.body.length}`);
+  const id = Buffer.from(requestId(), 'ascii');
+  // Memo hit: the head is pre-built; splice only a fresh request id in.
+  // The id is never served stale — it is minted per reply, per request.
+  if (result.prebuiltHead !== undefined) {
+    const tail = keepAlive ? result.prebuiltHead.tailKeepAlive : result.prebuiltHead.tailClose;
+    socket.write(Buffer.concat([result.prebuiltHead.head, id, tail, result.body]));
+    return;
   }
-  lines.push(`x-github-request-id: ${requestId()}`);
-  lines.push(`connection: ${keepAlive ? 'keep-alive' : 'close'}`);
-  for (const [k, v] of Object.entries(result.headers ?? {})) lines.push(`${k}: ${v}`);
-  const head = Buffer.from(`${lines.join('\r\n')}\r\n\r\n`, 'ascii');
-  socket.write(result.body.length === 0 ? head : Buffer.concat([head, result.body]));
+  const tpl = headTemplate(result.status, result.contentType, result.headers);
+  const end = keepAlive ? tpl.endKeepAlive : tpl.endClose;
+  if (result.status === 204) {
+    socket.write(Buffer.concat([tpl.start, id, end]));
+    return;
+  }
+  socket.write(Buffer.concat([tpl.start, Buffer.from(String(result.body.length), 'ascii'), tpl.mid, id, end, result.body]));
 }
 
 /** Drain buffered requests on one connection, strictly in order: one
