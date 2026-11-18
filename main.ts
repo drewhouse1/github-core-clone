@@ -1,25 +1,17 @@
-// The forge's entrypoint: launch the vendored Go core, tell the suite
-// where it listens, then wait until the suite says the trial is over.
+// The forge's entrypoint: start the HTTP server, tell the suite where it
+// listens, then wait until the suite says the trial is over.
 //
 // The suite (the "env") lives at MAKEFUN_ENV_URL. The lifecycle is:
-//   1. copy the Go core (go/forge) to a fresh temp dir and make it
-//      executable — /bot is read-only and the shipped binary may have lost
-//      its exec bit in transit — then spawn it with this process's
-//      environment (so it sees MAKEFUN_SHOP_TOKEN),
-//   2. read the core's `FORGE_LISTEN <port>` line from its stdout,
-//   3. POST {"port": <bound port>} to <env>/register,
-//   4. poll GET <env>/done until it answers {"done": true},
-//   5. kill the core and exit 0.
-// Without MAKEFUN_ENV_URL there is nothing to register with, so the core
-// keeps serving locally until this process is stopped.
-// The core serves every surface; this file only owns the lifecycle and
-// does nothing on the hot path. No wall clock or randomness is used
-// anywhere here, so two runs of the same trial behave identically.
+//   1. bind an ephemeral port (listen(0); never 8080, which the env owns),
+//   2. POST {"port": <bound port>} to <env>/register,
+//   3. poll GET <env>/done until it answers {"done": true},
+//   4. shut the server down and exit 0.
+// Without MAKEFUN_ENV_URL there is nothing to register with, so exit 1.
+// Everything the server serves comes from createApp() in app.ts; this file
+// only owns the lifecycle. No wall clock or randomness is used anywhere
+// here, so two runs of the same trial behave identically.
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { chmod, copyFile, mkdtemp } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { createApp } from './app.ts';
 
 // First pause between retries, in milliseconds. The pause doubles after
 // each failed attempt up to the caps below, so a briefly-unready env is
@@ -103,81 +95,42 @@ async function waitForDone(envUrl: string): Promise<void> {
   }
 }
 
-// Start the Go core and return the child process plus the port it bound.
-async function launchGoCore(): Promise<{ child: ChildProcess; port: number }> {
-  const dir = await mkdtemp(join(tmpdir(), 'forge-'));
-  const binPath = join(dir, 'forge');
-  await copyFile(new URL('./go/forge', import.meta.url), binPath);
-  await chmod(binPath, 0o755);
-  const child = spawn(binPath, [], { stdio: ['ignore', 'pipe', 'inherit'], env: process.env });
-  const port = await new Promise<number>((resolve, reject) => {
-    let buffer = '';
-    let settled = false;
-    child.stdout!.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8');
-      const newline = buffer.indexOf('\n');
-      if (newline < 0) return;
-      const line = buffer.slice(0, newline).trim();
-      const match = /^FORGE_LISTEN (\d+)$/.exec(line);
-      if (match === null) {
-        if (!settled) {
-          settled = true;
-          reject(new Error(`unexpected Go core output: ${line}`));
-        }
-        return;
-      }
-      if (!settled) {
-        settled = true;
-        resolve(Number(match[1]));
-      }
-    });
-    child.once('close', (code) => {
-      if (!settled) {
-        settled = true;
-        reject(new Error(`Go core exited before listening (code ${code})`));
-      }
-    });
-    child.once('error', (err) => {
-      if (!settled) {
-        settled = true;
-        reject(err);
-      }
-    });
-  });
-  return { child, port };
-}
-
 async function main(): Promise<void> {
   const envUrl = process.env.MAKEFUN_ENV_URL;
-  const { child, port } = await launchGoCore();
-  // If this launcher is killed, take the core down with it instead of
-  // orphaning it.
-  process.once('SIGINT', () => {
-    child.kill();
-    process.exit(130);
-  });
-  process.once('SIGTERM', () => {
-    child.kill();
-    process.exit(143);
+  if (envUrl === undefined || envUrl === '') {
+    console.error('MAKEFUN_ENV_URL is not set; nothing to register with');
+    process.exit(1);
+  }
+
+  const server = createApp();
+  server.on('error', (err: Error) => {
+    console.error(`server failed: ${err.message}`);
+    process.exit(1);
   });
 
-  if (envUrl === undefined || envUrl === '') {
-    // Local run: serve on the core's port for testing, no env to register with.
-    process.stdout.write(`[forge] listening on http://127.0.0.1:${port} (no MAKEFUN_ENV_URL; local mode)\n`);
-    await new Promise<void>(() => {});
-    return;
-  }
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('server bound to no TCP port'));
+        return;
+      }
+      resolve(address.port);
+    });
+  });
 
   const registered = await register(envUrl, port);
   if (!registered) {
     console.error(`could not register port ${port} with ${envUrl}`);
-    child.kill();
+    server.close();
     process.exit(1);
   }
 
   await waitForDone(envUrl);
-  child.kill();
-  await new Promise<void>((resolve) => child.once('close', () => resolve()));
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+  });
   process.exit(0);
 }
 
