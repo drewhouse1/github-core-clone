@@ -62,28 +62,16 @@ function lineText(item: PktItem): string {
 const PACK_TYPES: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 const TYPE_CODES: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
-/** Inflate one zlib stream starting at offset; find its exact end by binary search
- * (inflateSync ignores trailing bytes, and throws on a truncated stream). */
-function inflateEntry(buf: Buffer, offset: number): { data: Buffer; consumed: number } {
-  let lo = 1;
-  let hi = buf.length - offset;
-  if (hi <= 0) throw new Error('pack entry truncated');
-  // Invariant: lo-1 throws (or lo==1), hi succeeds. Binary search smallest succeeding L.
-  const ok = (len: number): boolean => {
-    try {
-      inflateSync(buf.subarray(offset, offset + len));
-      return true;
-    } catch {
-      return false;
-    }
+/** Inflate one zlib stream starting at offset. A single inflateSync with
+ * {info:true} reports exactly how many compressed bytes the stream consumed
+ * (engine.bytesWritten), so there is no probing and no error-driven search:
+ * one inflate per object, zero throws on the happy path. */
+function inflateAt(buf: Buffer, offset: number): { data: Buffer; consumed: number } {
+  const result = inflateSync(buf.subarray(offset), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
   };
-  if (!ok(hi)) throw new Error('pack entry zlib data truncated');
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (ok(mid)) hi = mid;
-    else lo = mid + 1;
-  }
-  return { data: inflateSync(buf.subarray(offset, offset + lo)), consumed: lo };
+  return { data: result.buffer, consumed: result.engine.bytesWritten };
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -149,7 +137,10 @@ export function readPack(buf: Buffer, resolveBase?: (oid: string) => GitObject |
   const expect = createHash('sha1').update(buf.subarray(0, buf.length - 20)).digest();
   if (!trailer.equals(expect)) throw new Error('pack checksum mismatch');
   const objects = new Map<string, GitObject>();
-  const pending: { oid: string; type: ObjType; data: Buffer; baseOid?: string; baseOff?: number; order: number }[] = [];
+  // Offset -> oid for every plain object, recorded inline during the single
+  // pass below; delta entries add their start offset here once resolved.
+  const offsetToOid = new Map<number, string>();
+  const pending: { oid: string; type: ObjType; data: Buffer; baseOid?: string; baseOff?: number; start: number }[] = [];
   let off = 12;
   let deltaCount = 0;
   for (let n = 0; n < count; n += 1) {
@@ -180,67 +171,24 @@ export function readPack(buf: Buffer, resolveBase?: (oid: string) => GitObject |
       off += 20;
       deltaCount += 1;
     }
-    const { data, consumed } = inflateEntry(buf, off);
+    const { data, consumed } = inflateAt(buf, off);
     off += consumed;
     if (data.length !== size) throw new Error('pack entry size mismatch');
     if (typeCode === 6 || typeCode === 7) {
-      const oid = hashObject('blob', data); // placeholder; real oid computed after resolve
-      void oid;
-      pending.push({ oid: '', type: 'blob', data, baseOid, baseOff, order: n });
+      pending.push({ oid: '', type: 'blob', data, baseOid, baseOff, start: entryStart });
     } else {
       const type = PACK_TYPES[typeCode];
       if (!type) throw new Error(`unknown pack object type ${typeCode}`);
       const oid = hashObject(type, data);
       objects.set(oid, { type, data });
-      pending.push({ oid, type, data, order: n });
+      offsetToOid.set(entryStart, oid);
+      pending.push({ oid, type, data, start: entryStart });
     }
   }
+  // Fast path: no deltas, no second pass at all.
+  if (deltaCount === 0) return { objects, count, deltaCount };
   // Resolve deltas in entry order (bases precede their deltas in well-formed packs;
   // fall back to repeated passes for safety).
-  const byOffset = new Map<number, { oid: string; type: ObjType; data: Buffer }>();
-  {
-    let o = 12;
-    // Re-walk offsets to map entry start -> resolved object is complex; instead
-    // resolve using the objects map + resolveBase, iterating until stable.
-    void o;
-  }
-  const unresolved = pending.filter((p) => p.baseOid !== undefined || p.baseOff !== undefined);
-  // For OFS deltas we need offset->oid mapping: rebuild it from the first pass.
-  // Simpler: re-scan the pack recording entry offsets and types.
-  const offsetToOid = new Map<number, string>();
-  {
-    let o = 12;
-    for (let n = 0; n < count; n += 1) {
-      const start = o;
-      let b = buf[o++];
-      const tc = (b >> 4) & 0x07;
-      let sz = b & 0x0f;
-      let sh = 4;
-      while (b & 0x80) {
-        b = buf[o++];
-        sz |= (b & 0x7f) << sh;
-        sh += 7;
-      }
-      if (tc === 6) {
-        let byte = buf[o++];
-        let base = byte & 0x7f;
-        while (byte & 0x80) {
-          byte = buf[o++];
-          base = ((base + 1) << 7) | (byte & 0x7f);
-        }
-        void base;
-      } else if (tc === 7) {
-        o += 20;
-      }
-      const { consumed } = inflateEntry(buf, o);
-      o += consumed;
-      void sz;
-      const entry = pending[n];
-      if (entry && entry.oid !== '') offsetToOid.set(start, entry.oid);
-      void start;
-    }
-  }
-  // Resolve deltas (possibly several passes: a delta's base may itself be a delta).
   const resolved = new Map<string, GitObject>(objects);
   const resolveOne = (p: { type: ObjType; data: Buffer; baseOid?: string; baseOff?: number }): GitObject | null => {
     let base: GitObject | undefined;
@@ -259,7 +207,7 @@ export function readPack(buf: Buffer, resolveBase?: (oid: string) => GitObject |
     const data = applyDelta(base.data, p.data);
     return { type: baseType, data };
   };
-  let remaining = unresolved.slice();
+  let remaining = pending.filter((p) => p.baseOid !== undefined || p.baseOff !== undefined);
   for (let pass = 0; pass < 10 && remaining.length > 0; pass += 1) {
     const next: typeof remaining = [];
     for (const p of remaining) {
@@ -270,30 +218,7 @@ export function readPack(buf: Buffer, resolveBase?: (oid: string) => GitObject |
       }
       const oid = hashObject(r.type, r.data);
       resolved.set(oid, r);
-      // Record offset mapping for deltas that pointed at this one via OFS:
-      // find the entry index of p and map its start offset.
-      const idx = pending.indexOf(p);
-      if (idx >= 0) {
-        // offset lookup: recompute start offset of entry idx
-        let o = 12;
-        for (let n = 0; n <= idx; n += 1) {
-          if (n === idx) offsetToOid.set(o, oid);
-          let b = buf[o++];
-          const tc = (b >> 4) & 0x07;
-          let sh = 4;
-          while (b & 0x80) {
-            b = buf[o++];
-            sh += 7;
-          }
-          void sh;
-          if (tc === 6) {
-            let byte = buf[o++];
-            while (byte & 0x80) byte = buf[o++];
-          } else if (tc === 7) o += 20;
-          const { consumed } = inflateEntry(buf, o);
-          o += consumed;
-        }
-      }
+      offsetToOid.set(p.start, oid);
     }
     if (next.length === remaining.length) break;
     remaining = next;
@@ -304,19 +229,17 @@ export function readPack(buf: Buffer, resolveBase?: (oid: string) => GitObject |
 
 /** Write a pack v2 of plain (undelted) objects, deterministic order (oid sort). */
 export function writePack(objs: Iterable<GitObject>): Buffer {
-  const list = [...objs];
-  list.sort((a, b) => {
-    const ao = hashObject(a.type, a.data);
-    const bo = hashObject(b.type, b.data);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  });
+  // Hash each object once up front; the old code re-hashed twice per sort
+  // comparison, which is pure waste at clone time.
+  const keyed = [...objs].map((obj) => ({ oid: hashObject(obj.type, obj.data), obj }));
+  keyed.sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
+  const list = keyed.map((k) => k.obj);
   const parts: Buffer[] = [];
   const head = Buffer.alloc(12);
   head.write('PACK', 0, 'ascii');
   head.writeUInt32BE(2, 4);
   head.writeUInt32BE(list.length, 8);
   parts.push(head);
-  const bodyHashes: string[] = [];
   for (const obj of list) {
     const typeCode = TYPE_CODES[obj.type];
     const size = obj.data.length;
@@ -334,9 +257,7 @@ export function writePack(objs: Iterable<GitObject>): Buffer {
     }
     parts.push(Buffer.from(headerBytes));
     parts.push(deflateSync(obj.data));
-    bodyHashes.push(hashObject(obj.type, obj.data));
   }
-  void bodyHashes;
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
   return Buffer.concat([body, trailer]);
@@ -688,12 +609,22 @@ export function handleUploadPack(store: Store, repo: Repo, body: Buffer, isV2: b
       else if (line.startsWith('command=')) command = line.slice('command='.length);
     }
     if (command === 'ls-refs') {
-      return { status: 200, body: handleLsRefs(store, repo, argLines), contentType: CT };
+      const key = `v2-ls:${wireFingerprint(repo)}:${JSON.stringify(argLines)}`;
+      const hit = wireGet(repo, key);
+      if (hit !== undefined) return { status: 200, body: hit, contentType: CT };
+      const answer = handleLsRefs(store, repo, argLines);
+      wireSet(repo, key, answer);
+      return { status: 200, body: answer, contentType: CT };
     }
     if (command === 'fetch') {
       const args = parseV2Fetch(body);
       if (args.wants.length === 0) return { status: 200, body: Buffer.concat([pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_FLUSH]), contentType: CT };
-      return { status: 200, body: fetchResponseV2(store, repo, args), contentType: CT };
+      const key = `v2-fetch:${wireFingerprint(repo)}:${JSON.stringify(args)}`;
+      const hit = wireGet(repo, key);
+      if (hit !== undefined) return { status: 200, body: hit, contentType: CT };
+      const answer = fetchResponseV2(store, repo, args);
+      wireSet(repo, key, answer);
+      return { status: 200, body: answer, contentType: CT };
     }
     // Unknown v2 command: answer a flush (client will fail the check, not crash).
     return { status: 200, body: Buffer.from('0000', 'ascii'), contentType: CT };
@@ -701,7 +632,45 @@ export function handleUploadPack(store: Store, repo: Repo, body: Buffer, isV2: b
   // v0 fetch
   const args = parseV0Fetch(body);
   if (args.wants.length === 0) return { status: 200, body: Buffer.concat([pktLine('NAK\n'), PKT_FLUSH]), contentType: CT };
-  return { status: 200, body: fetchResponseV0(store, repo, args), contentType: CT };
+  const key = `v0-fetch:${wireFingerprint(repo)}:${JSON.stringify(args)}`;
+  const hit = wireGet(repo, key);
+  if (hit !== undefined) return { status: 200, body: hit, contentType: CT };
+  const answer = fetchResponseV0(store, repo, args);
+  wireSet(repo, key, answer);
+  return { status: 200, body: answer, contentType: CT };
+}
+
+/** Memoized wire answers for upload-pack: an ls-refs or fetch reply is a pure
+ * function of (repo state, request args), and a clone burst asks the same
+ * questions fifty times. The fingerprint is every ref target plus the object
+ * count; the object store is append-only and content-addressed, so those two
+ * pin the reachable state — any push or ref move changes the fingerprint and
+ * retires every stale entry at once. Entries are per repo object, capped. */
+const wireCache = new WeakMap<Repo, Map<string, Buffer>>();
+const WIRE_CACHE_MAX = 64;
+
+function wireFingerprint(repo: Repo): string {
+  const refs: string[] = [];
+  for (const [name, oid] of repo.refs) refs.push(`${name}=${oid}`);
+  refs.sort();
+  return `${refs.join(',')}|${repo.objects.size}`;
+}
+
+function wireGet(repo: Repo, key: string): Buffer | undefined {
+  return wireCache.get(repo)?.get(key);
+}
+
+function wireSet(repo: Repo, key: string, body: Buffer): void {
+  let per = wireCache.get(repo);
+  if (per === undefined) {
+    per = new Map<string, Buffer>();
+    wireCache.set(repo, per);
+  }
+  if (per.size >= WIRE_CACHE_MAX) {
+    const oldest = per.keys().next().value as string | undefined;
+    if (oldest !== undefined) per.delete(oldest);
+  }
+  per.set(key, body);
 }
 
 // ---------------------------------------------------------------- receive-pack

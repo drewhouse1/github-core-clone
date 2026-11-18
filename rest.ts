@@ -6,6 +6,10 @@ export interface Resp {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  // Pre-serialized JSON text (no trailing newline); when set, app.ts sends
+  // it verbatim instead of JSON.stringify-ing body. Lets hot paths skip the
+  // object graph + stringify entirely.
+  text?: string;
 }
 
 export function err(status: number, message: string): Resp {
@@ -14,6 +18,10 @@ export function err(status: number, message: string): Resp {
 
 export function ok(status: number, body: unknown, headers?: Record<string, string>): Resp {
   return { status, body, headers };
+}
+
+export function okText(status: number, text: string, headers?: Record<string, string>): Resp {
+  return { status, body: null, headers, text };
 }
 
 export function repoJson(store: Store, repo: Repo): Record<string, unknown> {
@@ -35,6 +43,40 @@ export function repoJson(store: Store, repo: Repo): Record<string, unknown> {
     has_projects: false,
     has_wiki: false,
   };
+}
+
+/** JSON-escape a string, fast path first: when it holds no quote, backslash
+ * or control character, wrapping it in quotes is already valid JSON, so no
+ * JSON.stringify call (and no allocation beyond the result) is needed. */
+export function jsonString(s: string): string {
+  if (!/["\\\u0000-\u001f]/.test(s)) return `"${s}"`;
+  return JSON.stringify(s);
+}
+
+/** Serialize one issue to its exact REST JSON document by string template,
+ * field for field the same bytes JSON.stringify(issueJson(...)) produces —
+ * without allocating the object graph. Cached on the issue; any mutation of
+ * the issue must clear issue.jsonCache first (see the PATCH/comment sites
+ * below and gql.ts closeIssue/addComment). */
+export function issueText(store: Store, repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: string[]; seq: number; comments: { id: number }[]; jsonCache?: string }): string {
+  const cached = issue.jsonCache;
+  if (cached !== undefined) return cached;
+  const labels = issue.labels
+    .map((name) => {
+      const l = repo.labels.get(name);
+      return `{"name":${jsonString(name)},"color":${jsonString(l ? l.color : 'ededed')}}`;
+    })
+    .join(',');
+  const created = store.tsIso(issue.seq);
+  const text =
+    `{"id":${issue.id},"node_id":${jsonString(`I${repo.id}_${issue.number}`)},"number":${issue.number},` +
+    `"title":${jsonString(issue.title)},"body":${jsonString(issue.body)},"state":${jsonString(issue.state)},` +
+    `"labels":[${labels}],"user":{"login":${jsonString(store.viewerLogin)},"id":${store.viewerId},"type":"User"},` +
+    `"created_at":${jsonString(created)},"updated_at":${jsonString(created)},"comments":${issue.comments.length},` +
+    `"comments_url":${jsonString(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments`)},` +
+    `"html_url":${jsonString(`https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`)}}`;
+  issue.jsonCache = text;
+  return text;
 }
 
 export function issueJson(store: Store, repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: string[]; seq: number; comments: { id: number }[] }): Record<string, unknown> {
@@ -417,7 +459,7 @@ export function handleRest(ctx: RestCtx, method: string, segs: string[]): Resp {
         const seq = store.nextSeq();
         const issue = { id: store.issueIdSeq, number: repo.issueSeq, title, body, state: 'open' as const, labels: labels.slice(), seq, comments: [] as { id: number; body: string; seq: number }[] };
         repo.issues.set(issue.number, issue);
-        return ok(201, issueJson(store, repo, issue));
+        return okText(201, issueText(store, repo, issue));
       }
       if (method === 'GET') {
         const state = query.get('state') ?? 'open';
@@ -438,7 +480,7 @@ export function handleRest(ctx: RestCtx, method: string, segs: string[]): Resp {
     if (rest.length === 2) {
       if (method === 'GET') {
         if (!issue) return err(404, 'Not Found');
-        return ok(200, issueJson(store, repo, issue));
+        return okText(200, issueText(store, repo, issue));
       }
       if (method === 'PATCH') {
         if (!issue) return err(404, 'Not Found');
@@ -453,7 +495,8 @@ export function handleRest(ctx: RestCtx, method: string, segs: string[]): Resp {
           }
           issue.labels = labels.slice();
         }
-        return ok(200, issueJson(store, repo, issue));
+        issue.jsonCache = undefined;
+        return okText(200, issueText(store, repo, issue));
       }
       return err(404, 'Not Found');
     }
@@ -466,6 +509,7 @@ export function handleRest(ctx: RestCtx, method: string, segs: string[]): Resp {
         const seq = store.nextSeq();
         const comment = { id: store.commentIdSeq, body, seq };
         issue.comments.push(comment);
+        issue.jsonCache = undefined;
         return ok(201, { id: comment.id, node_id: `C${comment.id}`, body, user: { login: store.viewerLogin, id: store.viewerId, type: 'User' }, created_at: store.tsIso(seq), updated_at: store.tsIso(seq) });
       }
       if (method === 'GET') {

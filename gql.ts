@@ -351,7 +351,7 @@ export class GraphQLExecutor {
     return undefined;
   }
 
-  issueByGlobalId(id: string): { repo: Repo; issue: { id: number; number: number; title: string; body: string; state: string; labels: string[]; seq: number; comments: { id: number; body: string; seq: number }[] } } | undefined {
+  issueByGlobalId(id: string): { repo: Repo; issue: { id: number; number: number; title: string; body: string; state: string; labels: string[]; seq: number; comments: { id: number; body: string; seq: number }[]; jsonCache?: string } } | undefined {
     const m = /^I(\d+)_(\d+)$/.exec(id);
     if (!m) return undefined;
     const repo = this.repoByGlobalId(`R${m[1]}`);
@@ -463,6 +463,7 @@ export class GraphQLExecutor {
       return null;
     }
     found.issue.state = 'closed';
+    found.issue.jsonCache = undefined;
     return this.resolveSelections({ __type: 'CloseIssuePayload', __issue: found.issue, __repo: found.repo }, sel.selections, vars);
   }
 
@@ -557,6 +558,7 @@ export class GraphQLExecutor {
     const seq = this.store.nextSeq();
     const comment = { id: this.store.commentIdSeq, body: String(input.body ?? ''), seq };
     found.issue.comments.push(comment);
+    found.issue.jsonCache = undefined;
     const edge: Obj = { __type: 'CommentEdge', __comment: comment, __repo: found.repo };
     return this.resolveSelections({ __type: 'AddCommentPayload', __edge: edge }, sel.selections, vars);
   }

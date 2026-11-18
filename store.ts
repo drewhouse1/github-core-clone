@@ -31,6 +31,9 @@ export interface Issue {
   labels: string[];
   seq: number;
   comments: Comment[];
+  // Cached template-serialized JSON for this issue (rest.ts issueText);
+  // cleared by every mutation of the issue. Derived bytes only.
+  jsonCache?: string;
 }
 
 export interface Comment {
@@ -96,6 +99,13 @@ export class Store {
   pullIdSeq = 0;
   repos = new Map<string, Repo>(); // key owner + '/' + name
   reqSeq = 0;
+  // Bumped once per completed mutating request; response caches key on it,
+  // so any mutation retires every memoized answer at once.
+  version = 0;
+
+  bumpVersion(): void {
+    this.version += 1;
+  }
 
   constructor(viewer: { login: string; name: string; email: string; id: number }) {
     this.viewerLogin = viewer.login;
